@@ -15,7 +15,10 @@ Requires:
 Output: prints the FOFA credentials (email/password/username) to stdout and appends
 them to the out file as JSON. Exit 0 on success (account confirmed + logged in).
 """
-import sys, os, json, time, random, string, argparse, subprocess, urllib.request, urllib.parse
+import sys, os, json, time, random, string, argparse, subprocess, urllib.request, urllib.parse, threading
+
+# Guards concurrent registry / archive writes when --create N runs in parallel.
+_REGISTRY_LOCK = threading.Lock()
 
 CDP_BASE = "http://127.0.0.1:9222"
 REGISTER_URL = "https://i.nosec.org/register?locale=en&service=https://en.fofa.info/f_login?login_redirect_url=/"
@@ -233,17 +236,18 @@ def run_create(brave_port, out_file, password=EASY_PASSWORD, venv_python=None):
                  "activation_email": activation_msg}
         browser.close()
 
-        # append to out file (registry)
-        records = []
-        if os.path.exists(out_file):
-            try:
-                with open(out_file) as f:
-                    records = json.load(f)
-            except Exception:
-                records = []
-        records.append(creds)
-        with open(out_file, "w") as f:
-            json.dump(records, f, indent=2)
+        # append to out file (registry) — thread-safe for concurrent --create N
+        with _REGISTRY_LOCK:
+            records = []
+            if os.path.exists(out_file):
+                try:
+                    with open(out_file) as f:
+                        records = json.load(f)
+                except Exception:
+                    records = []
+            records.append(creds)
+            with open(out_file, "w") as f:
+                json.dump(records, f, indent=2)
         print("[+] saved registry ->", out_file)
 
         return logged_in, creds
@@ -349,17 +353,20 @@ def do_login(page, email, password, login_url, max_attempts=4):
     return logged_in, final_url, title
 
 
-def find_free_port(start=9300, end=9399):
-    """Return a free TCP port in [start,end] by trying to bind."""
-    import socket
-    for p in range(start, end):
-        with socket.socket() as s:
-            try:
-                s.bind(("127.0.0.1", p))
-                return p
-            except OSError:
-                continue
-    return None
+_PORT_COUNTER = [9499]  # monotonic allocator; each call hands out the NEXT-lower port (unique)
+
+
+def find_free_port(start=9400, end=9499):
+    """Return a free TCP port in [start,end]. UNIQUE per call (monotonic counter), so concurrent
+    threads can never select the same port even if Brave hasn't finished binding yet. The counter
+    walks DOWNWARD from a high base; if a port is already taken (leftover Brave), the caller's own
+    Brave just fails to bind and that account retries — callers always get distinct port numbers."""
+    with _REGISTRY_LOCK:
+        p = _PORT_COUNTER[0]
+        _PORT_COUNTER[0] = p - 1
+        if p < start:
+            return None
+        return p
 
 
 def launch_fresh_brave(port):
@@ -424,11 +431,12 @@ def main():
 
     keep = args.keep_sessions or args.keep_brave
 
-    ok_all = True
-    created = []
-    for i in range(count):
+    import concurrent.futures as _cf
+
+    def create_one(idx):
+        """Create ONE account in its OWN isolated Brave session. Run concurrently per account."""
         print("=" * 60)
-        print("[*] creating account %d/%d" % (i + 1, count))
+        print("[*] creating account %d/%d" % (idx + 1, count))
         print("=" * 60)
         owned_proc = None
         profile_dir = None
@@ -437,11 +445,11 @@ def main():
         else:
             port = find_free_port()
             if port is None:
-                print("[!] no free port found")
-                sys.exit(1)
+                print("[!] account %d: no free port found" % (idx + 1))
+                return False, None
             owned_proc, profile_dir = launch_fresh_brave(port)
             brave_port = port
-            print("[*] fresh Brave on CDP port %d (profile: %s)" % (port, profile_dir))
+            print("[*] account %d fresh Brave on CDP port %d (profile: %s)" % (idx + 1, port, profile_dir))
 
         ok, creds = run_create(brave_port, args.out, args.password, py)
 
@@ -449,19 +457,35 @@ def main():
         if creds:
             creds["session"] = {"brave_port": brave_port, "profile_dir": profile_dir,
                                 "keep_open": bool(keep)}
-            # re-save creds with session info into the per-account archive
-            _save_secure(creds)
-            created.append(creds)
+            _save_secure(creds)  # thread-safe (uses per-account filename)
 
         if owned_proc and not keep:
             try:
                 owned_proc.terminate()
-                print("[+] closed account %d Brave (--keep-sessions to hold it)" % (i + 1))
+                print("[+] closed account %d Brave (--keep-sessions to hold it)" % (idx + 1))
             except Exception:
                 pass
         if not ok:
-            ok_all = False
-            print("[!] account %d did not complete" % (i + 1))
+            print("[!] account %d did not complete" % (idx + 1))
+        return ok, creds
+
+    results = []
+    # Run all accounts CONCURRENTLY (each its own thread + its own isolated Brave).
+    max_workers = count if shared_port is None else 1
+    with _cf.ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futures = {ex.submit(create_one, i): i for i in range(count)}
+        for fut in _cf.as_completed(futures):
+            idx = futures[fut]
+            try:
+                ok, creds = fut.result()
+            except Exception as e:
+                print("[!] account %d raised: %s" % (idx + 1, str(e)[:80]))
+                ok, creds = False, None
+            results.append((idx, ok, creds))
+
+    results.sort(key=lambda r: r[0])
+    created = [c for _, ok, c in results if ok and c]
+    ok_all = len(created) == count
 
     if created and ok_all:
         print("\n[OK] %d FOFA account(s) created & logged in:" % count)

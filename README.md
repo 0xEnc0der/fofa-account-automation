@@ -88,23 +88,31 @@ fofa --create --password 'S3cretPw!'  # override account password
 fofa --create --secure-dir /path/dir  # per-account archive dir (default ~/.fofa-accounts)
 ```
 
-### `--create N` = N isolated accounts
+### `--create N` = N isolated accounts, created CONCURRENTLY
 
-`--create` takes an integer count (default 1). Each account is created in its **own freshly-launched
-Brave** — separate `--user-data-dir` profile and its own CDP port — so the accounts are fully
-independent (no shared cookies/sessions). With `--keep-sessions` (or its alias `--keep-brave`), each
-account's Brave is left running after creation and the archive records that session's **CDP port and
-profile dir**, so you can reconnect to and reuse each account's browser independently (e.g. via
-Playwright `connect_over_cdp("http://127.0.0.1:<port>")`).
+`--create` takes an integer count (default 1). All N accounts are created **in parallel** — each runs
+in its own thread against its **own freshly-launched Brave** (separate `--user-data-dir` profile and
+its own unique CDP port, handed out by a thread-safe monotonic allocator so no two sessions ever
+collide). The accounts are fully independent (no shared cookies/sessions) and are minted at the same
+time rather than one-after-another. With `--keep-sessions` (alias `--keep-brave`), each account's Brave
+is left running and the archive records that session's **CDP port and profile dir**, so you can
+reconnect to and reuse each account's browser independently (e.g. via Playwright
+`connect_over_cdp("http://127.0.0.1:<port>")`).
 
 ```
-[OK] 2 FOFA account(s) created & logged in:
-    email: fofagenXXXX@tempinbox.xyz | user: secpocXXXXXX | pwd: SecPass123!x | session port 9304
-    email: fofagenYYYY@tempinbox.xyz | user: secpocYYYYYY | pwd: SecPass123!x | session port 9302
+[OK] 3 FOFA account(s) created & logged in:
+    email: fofagenXXXX@tempinbox.xyz | user: secpocXXXXXX | pwd: SecPass123!x | session port 9499
+    email: fofagenYYYY@tempinbox.xyz | user: secpocYYYYYY | pwd: SecPass123!x | session port 9498
+    email: fofagenZZZZ@tempinbox.xyz | user: secpocZZZZZZ | pwd: SecPass123!x | session port 9497
 ```
 
 Each account's archive file (`~/.fofa-accounts/<email>.json`) includes a `session` object:
 `{"brave_port": <port>, "profile_dir": <path>, "keep_open": true}` for reuse.
+
+> ⚠️ On a constrained machine, spawning many headed Brave instances at once can cause transient
+> nav/Turnstile timeouts. Those are retried automatically (reload + re-solve per account); each
+> account's flow runs independently so one slow account doesn't block the others. Pair it with
+> `--brave-port` only if you deliberately want ONE shared session (then accounts run sequentially).
 
 ### Flags
 
