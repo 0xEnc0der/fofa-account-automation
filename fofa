@@ -246,18 +246,6 @@ def run_create(brave_port, out_file, password=EASY_PASSWORD, venv_python=None):
             json.dump(records, f, indent=2)
         print("[+] saved registry ->", out_file)
 
-        # ALSO write each account's full record (creds + captured email) to a secure dot-dir.
-        # ~/.fofa-accounts/ is chmod 0700 and chosen for privacy.
-        secure_dir = os.environ.get("FOFA_SECURE_DIR", os.path.expanduser("~/.fofa-accounts"))
-        try:
-            os.makedirs(secure_dir, mode=0o700, exist_ok=True)
-            per = os.path.join(secure_dir, email.replace("@", "_at_") + ".json")
-            with open(per, "w") as f:
-                json.dump(creds, f, indent=2)
-            os.chmod(per, 0o600)
-            print("[+] saved email+creds ->", per)
-        except Exception as e:
-            print("[!] secure-dir save failed:", str(e)[:50])
         return logged_in, creds
 
 
@@ -401,21 +389,25 @@ def launch_fresh_brave(port):
 
 def main():
     ap = argparse.ArgumentParser(prog="fofa", description="FOFA account automation")
-    ap.add_argument("--create", action="store_true", help="create a FOFA account")
-    ap.add_argument("--brave-port", default=None, help="Brave CDP port. If omitted, fofa launches its own fresh Brave on a free port (recommended).")
+    ap.add_argument("--create", default="1", help="create N FOFA accounts (default 1). Each account gets its OWN isolated browser session.")
+    ap.add_argument("--brave-port", default=None, help="attach to ONE existing Brave CDP port. When creating >1 account, prefer no --brave-port so each gets its own.")
     ap.add_argument("--out", default=os.path.expanduser("~/fofa-accounts.json"), help="creds output JSON")
     ap.add_argument("--python", default=None, help="python interpreter with playwright (auto-detect if omitted)")
     ap.add_argument("--password", default=EASY_PASSWORD, help="FOFA account password (default: the shared easy password)")
     ap.add_argument("--secure-dir", default=None, help="dir to save each account's creds+email (default ~/.fofa-accounts, env FOFA_SECURE_DIR)")
-    ap.add_argument("--keep-brave", action="store_true", help="do not kill the auto-launched Brave when done")
+    ap.add_argument("--keep-sessions", action="store_true", help="leave each account's Brave OPEN after creation and record its CDP port+profile dir in the archive")
+    ap.add_argument("--keep-brave", action="store_true", help="alias for --keep-sessions (keeps the auto-launched Braven running)")
     args = ap.parse_args()
 
     if args.secure_dir:
         os.environ["FOFA_SECURE_DIR"] = args.secure_dir
 
-    if not args.create:
-        ap.print_help()
-        sys.exit(0)
+    # parse the count: --create 5   (also accept --create 5 or bare --create -> 1)
+    try:
+        count = int(args.create)
+    except ValueError:
+        count = 1
+    count = max(1, count)
 
     py = args.python
     if not py:
@@ -424,37 +416,78 @@ def main():
                 py = cand
                 break
 
-    # Auto-launch a fresh Brave if no port given (recommended — avoids a reused, logged-in profile).
-    owned_proc = None
-    if args.brave_port is None:
-        port = find_free_port()
-        if port is None:
-            print("[!] no free port found")
-            sys.exit(1)
-        print("[*] launching fresh Brave on CDP port", port, "(clean profile)")
-        owned_proc, _prof = launch_fresh_brave(port)
-        brave_port = port
-    else:
-        brave_port = int(args.brave_port)
+    # If --brave-port given, that one Brave is shared across ALL accounts (warning for >1).
+    shared_port = int(args.brave_port) if args.brave_port else None
+    if shared_port and count > 1:
+        print("[!] --brave-port shares ONE session across %d accounts; each account will not be isolated." % count)
+        print("[!] omit --brave-port to give each account its own isolated browser session.")
 
-    ok, creds = run_create(brave_port, args.out, args.password, py)
+    keep = args.keep_sessions or args.keep_brave
 
-    if owned_proc and not args.keep_brave:
-        try:
-            owned_proc.terminate()
-            print("[+] closed the fresh Brave (--keep-brave to hold it)")
-        except Exception:
-            pass
+    ok_all = True
+    created = []
+    for i in range(count):
+        print("=" * 60)
+        print("[*] creating account %d/%d" % (i + 1, count))
+        print("=" * 60)
+        owned_proc = None
+        profile_dir = None
+        if shared_port:
+            brave_port = shared_port
+        else:
+            port = find_free_port()
+            if port is None:
+                print("[!] no free port found")
+                sys.exit(1)
+            owned_proc, profile_dir = launch_fresh_brave(port)
+            brave_port = port
+            print("[*] fresh Brave on CDP port %d (profile: %s)" % (port, profile_dir))
 
-    if ok:
-        print("[OK] FOFA account created & logged in:")
-        print("    email:", creds["email"])
-        print("    password:", creds["password"])
-        print("    username:", creds["username"])
+        ok, creds = run_create(brave_port, args.out, args.password, py)
+
+        # record session info so each account's browser can be reused independently
+        if creds:
+            creds["session"] = {"brave_port": brave_port, "profile_dir": profile_dir,
+                                "keep_open": bool(keep)}
+            # re-save creds with session info into the per-account archive
+            _save_secure(creds)
+            created.append(creds)
+
+        if owned_proc and not keep:
+            try:
+                owned_proc.terminate()
+                print("[+] closed account %d Brave (--keep-sessions to hold it)" % (i + 1))
+            except Exception:
+                pass
+        if not ok:
+            ok_all = False
+            print("[!] account %d did not complete" % (i + 1))
+
+    if created and ok_all:
+        print("\n[OK] %d FOFA account(s) created & logged in:" % count)
+        for c in created:
+            line = "    email: %s | user: %s | pwd: %s" % (c["email"], c["username"], c["password"])
+            if keep:
+                line += " | session port %s" % (c["session"]["brave_port"])
+            print(line)
         sys.exit(0)
     else:
-        print("[FAIL] account creation did not complete")
+        print("\n[FAIL] not all accounts completed (%d/%d ok)" % (len(created), count))
         sys.exit(1)
+
+
+def _save_secure(creds):
+    """Write a per-account record (incl. session info) to the secure dir. Idempotent."""
+    secure_dir = os.environ.get("FOFA_SECURE_DIR", os.path.expanduser("~/.fofa-accounts"))
+    try:
+        os.makedirs(secure_dir, mode=0o700, exist_ok=True)
+        per = os.path.join(secure_dir, creds["email"].replace("@", "_at_") + ".json")
+        with open(per, "w") as f:
+            json.dump(creds, f, indent=2)
+        os.chmod(per, 0o600)
+        print("[+] saved email+session+creds ->", per)
+    except Exception as e:
+        print("[!] secure-dir save failed:", str(e)[:50])
 
 
 if __name__ == "__main__":

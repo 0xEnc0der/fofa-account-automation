@@ -80,23 +80,42 @@ The **recommended** invocation needs no manual browser setup — `fofa` spins up
 
 ```bash
 fofa --create                         # full flow; auto-launches a fresh Brave + cleans up
-fofa --create --keep-brave            # auto-launch but leave the Brave running after
-fofa --create --brave-port 9224       # attach to an already-running Brave on a given CDP port
+fofa --create 5                       # create 5 accounts; each gets its OWN isolated browser session
+fofa --create 5 --keep-sessions       # ... and leave each account's Brave OPEN (recorded per-account)
+fofa --create --brave-port 9224       # attach to an existing single Brave (shares one session)
 fofa --create --out ~/fofa-accts.json # registry output file (default ~/fofa-accounts.json)
 fofa --create --password 'S3cretPw!'  # override account password
 fofa --create --secure-dir /path/dir  # per-account archive dir (default ~/.fofa-accounts)
 ```
 
+### `--create N` = N isolated accounts
+
+`--create` takes an integer count (default 1). Each account is created in its **own freshly-launched
+Brave** — separate `--user-data-dir` profile and its own CDP port — so the accounts are fully
+independent (no shared cookies/sessions). With `--keep-sessions` (or its alias `--keep-brave`), each
+account's Brave is left running after creation and the archive records that session's **CDP port and
+profile dir**, so you can reconnect to and reuse each account's browser independently (e.g. via
+Playwright `connect_over_cdp("http://127.0.0.1:<port>")`).
+
+```
+[OK] 2 FOFA account(s) created & logged in:
+    email: fofagenXXXX@tempinbox.xyz | user: secpocXXXXXX | pwd: SecPass123!x | session port 9304
+    email: fofagenYYYY@tempinbox.xyz | user: secpocYYYYYY | pwd: SecPass123!x | session port 9302
+```
+
+Each account's archive file (`~/.fofa-accounts/<email>.json`) includes a `session` object:
+`{"brave_port": <port>, "profile_dir": <path>, "keep_open": true}` for reuse.
+
 ### Flags
 
 | Flag | Default | Meaning |
 |------|---------|---------|
-| `--create` | — | run the full account-creation flow |
-| `--brave-port` | *(auto)* | CDP port of an existing Brave. If omitted, a fresh Brave is started on a free port. |
-| `--keep-brave` | off | keep the auto-launched Brave running when the script finishes |
+| `--create N` | `1` | number of accounts to create. Each gets its own isolated browser session. |
+| `--brave-port` | *(auto)* | CDP port of an existing Brave. If omitted, a fresh Brave is started per account on a free port. |
+| `--keep-sessions` / `--keep-brave` | off | leave each account's Brave open and record its CDP port + profile dir in the archive |
 | `--out` | `~/fofa-accounts.json` | where the registry (list of accounts) is appended |
 | `--password` | `SecPass123!x` | the FOFA account password (the tool's shared "easy" default) |
-| `--secure-dir` | `~/.fofa-accounts` | per-account file archive (creds + captured email) |
+| `--secure-dir` | `~/.fofa-accounts` | per-account file archive (creds + captured email + session info) |
 | `--python` | *(auto-detect)* | Python interpreter that has Playwright |
 
 ### Output
