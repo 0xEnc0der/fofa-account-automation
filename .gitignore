@@ -1,0 +1,20 @@
+# Never commit real account credentials, tempinbox inboxes, or local archives.
+~/fofa-accounts.json
+~/.fofa-accounts/
+*.json
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local secrets — keep any real TOKEN/creds out of the repo.
+.env
+*.token

@@ -1,0 +1,4 @@
+# Playwright is the only runtime dependency.
+# Install a Python 3.14 venv with a working greenlet, e.g.:
+#   python3 -m venv ~/fofa-venv && ~/fofa-venv/bin/pip install -r requirements.txt
+playwright>=1.62
