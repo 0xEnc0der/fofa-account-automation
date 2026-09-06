@@ -114,9 +114,19 @@ FOFA_POINTS_PER_PAGE = 10     # each results page (10 hosts) costs 10 points
 QUOTA_FILE = os.path.expanduser("~/.fofa-accounts/fofa_quota.json")
 
 
-def load_quota():
+def _quota_path(email=None):
+    """Per-account quota file when an email is given (each account has its own
+    3,000-point budget); falls back to the global file for shared-session runs."""
+    if email:
+        safe = re.sub(r'[^A-Za-z0-9._-]+', '_', email)
+        return os.path.expanduser("~/.fofa-accounts/quota_%s.json" % safe)
+    return QUOTA_FILE
+
+
+def load_quota(email=None):
+    path = _quota_path(email)
     try:
-        with open(QUOTA_FILE) as f:
+        with open(path) as f:
             d = json.load(f)
     except Exception:
         d = {}
@@ -128,14 +138,15 @@ def load_quota():
     return d
 
 
-def save_quota(d):
-    os.makedirs(os.path.dirname(QUOTA_FILE), exist_ok=True)
-    with open(QUOTA_FILE, "w") as f:
+def save_quota(d, email=None):
+    path = _quota_path(email)
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
         json.dump(d, f, indent=2)
 
 
-def quota_remaining():
-    d = load_quota()
+def quota_remaining(email=None):
+    d = load_quota(email)
     return max(0, FOFA_POINTS_FREE - d["used_points"])
 
 
@@ -176,7 +187,7 @@ def _page_total(page):
     return None
 
 
-def harvest_dork_download(page, dork, want=100, out_dir=None, dl_dir=None):
+def harvest_dork_download(page, dork, want=100, out_dir=None, dl_dir=None, email=None):
     """Harvest hosts for one dork using FOFA's official Download Results function.
 
     Free tier: 3,000 result-points/month. The download dialog consumes
@@ -188,6 +199,7 @@ def harvest_dork_download(page, dork, want=100, out_dir=None, dl_dir=None):
     'Available' -> download its CSV -> parse hosts.
 
     want: how many results to request for this dork (capped by free credit).
+    email: attribute the quota usage to this account (per-account budget).
     Returns (hosts_list, downloaded_count, total_reported)."""
     qb = base64.b64encode(dork.encode()).decode()
     out_dir = out_dir or os.path.expanduser("~/.fofa-accounts/dorks")
@@ -251,14 +263,14 @@ def harvest_dork_download(page, dork, want=100, out_dir=None, dl_dir=None):
         raise RuntimeError("Download Results dialog did not open")
     free_credit = _parse_count(dlg.get("free_credit"), 0)
 
-    remaining = quota_remaining()
+    remaining = quota_remaining(email)
     # The dialog credit is the source of truth. If the local tracker drifted (manual downloads
     # elsewhere, earlier debug runs), resync it DOWN to FOFA's number.
     if free_credit < remaining:
         drift = remaining - free_credit
-        quota = load_quota()
+        quota = load_quota(email)
         quota["used_points"] = min(FOFA_POINTS_FREE, quota["used_points"] + drift)
-        save_quota(quota)
+        save_quota(quota, email)
         print("    [i] resynced quota tracker to FOFA's free credit (%d left; drift %d)"
               % (free_credit, drift))
         remaining = free_credit
@@ -323,9 +335,9 @@ def harvest_dork_download(page, dork, want=100, out_dir=None, dl_dir=None):
     hosts = [h for h in hosts if h]
 
     # ---- account the quota (1 result = 1 point) ----
-    quota = load_quota()
+    quota = load_quota(email)
     quota["used_points"] += len(hosts) if hosts else n
-    save_quota(quota)
+    save_quota(quota, email)
 
     # ---- save per-dork output (plain host list) ----
     safe = re.sub(r'[^A-Za-z0-9._-]+', '_', dork)[:80]
@@ -373,6 +385,73 @@ def run_dorks(dorks, brave_port, want=100, out_dir=None, quota_cap_points=None):
                 print("    [!] dork failed: %s" % str(e)[:80])
                 results[dork] = []
         browser.close()
+    return results
+
+
+def run_dorks_max_per_account(dorks, password=EASY_PASSWORD, out_dir=None, parallel=2,
+                              registry=None, keep_braves=True):
+    """One FRESH account per dork; each account downloads as many hosts as its free
+    credit allows (want=0 -> capped only by credit/result-total). Accounts are minted
+    `parallel` at a time, each in its own isolated Brave on its own CDP port.
+
+    Returns list of {dork, email, brave_port, profile_dir, hosts, total}."""
+    from playwright.sync_api import sync_playwright
+    out_dir = out_dir or os.path.expanduser("~/.fofa-accounts/dorks")
+    registry = registry or os.path.expanduser("~/fofa-accounts.json")
+    results = []
+
+    def one(idx_dork):
+        idx, dork = idx_dork
+        tag = "dork %d/%d [%s]" % (idx + 1, len(dorks), dork[:40])
+        # ---- mint a fresh account on its own session ----
+        port = find_free_port()
+        if port is None:
+            print("[%s] no free port" % tag)
+            return {"dork": dork, "email": None, "hosts": [], "total": None, "error": "no port"}
+        proc, profile_dir = launch_fresh_brave(port)
+        print("[%s] fresh account/browser on port %d" % (tag, port))
+        email = None
+        hosts, total = [], None
+        try:
+            ok, creds = run_create(port, registry, password)
+            if not ok or not creds:
+                raise RuntimeError("account creation failed")
+            email = creds["email"]
+
+            # ---- max download for this dork on this account ----
+            with sync_playwright() as pw:
+                browser = pw.chromium.connect_over_cdp("http://127.0.0.1:%d" % port)
+                ctx = browser.contexts[0]
+                page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                hosts, got, total = harvest_dork_download(page, dork, want=0, out_dir=out_dir,
+                                                          email=email)
+                browser.close()
+            print("[%s] DONE: %d hosts (total on FOFA: %s)" % (tag, len(hosts), total))
+            return {"dork": dork, "email": email, "brave_port": port,
+                    "profile_dir": profile_dir, "hosts": hosts, "total": total}
+        except Exception as e:
+            print("[%s] FAILED: %s" % (tag, str(e)[:90]))
+            return {"dork": dork, "email": email, "brave_port": port,
+                    "profile_dir": profile_dir, "hosts": [], "total": total,
+                    "error": str(e)[:120]}
+        finally:
+            if not keep_braves and proc:
+                try:
+                    proc.terminate()
+                except Exception:
+                    pass
+
+    import concurrent.futures as _cf
+    with _cf.ThreadPoolExecutor(max_workers=max(1, parallel)) as ex:
+        for res in ex.map(one, list(enumerate(dorks))):
+            results.append(res)
+
+    ok = [r for r in results if r.get("hosts")]
+    print("\n[OK] %d/%d dorks harvested, %d hosts total" % (len(ok), len(dorks),
+                                                            sum(len(r["hosts"]) for r in results)))
+    for r in results:
+        print("    %-45s -> %5d hosts (total %s) via %s" % (
+            r["dork"][:45], len(r["hosts"]), r.get("total"), r.get("email")))
     return results
 
 
@@ -689,6 +768,8 @@ def main():
     ap.add_argument("--dork-pages", type=int, default=None, help="(legacy) pages per dork; converted to --dork-count = pages*10")
     ap.add_argument("--dork-out", default=None, metavar="DIR", help="dir for per-dork host files (default ~/.fofa-accounts/dorks)")
     ap.add_argument("--dork-cap", type=int, default=None, metavar="POINTS", help="stop when remaining quota points reach this floor")
+    ap.add_argument("--dorks-max", action="store_true", help="one FRESH account per dork; each downloads the MAXIMUM its free credit allows (~2900+ hosts)")
+    ap.add_argument("--parallel", type=int, default=2, metavar="N", help="with --dorks-max: accounts minted concurrently (default 2)")
     ap.add_argument("--quota", action="store_true", help="print the tracked monthly quota and exit")
     args = ap.parse_args()
 
@@ -713,6 +794,21 @@ def main():
         if not dorks:
             print("[!] no dorks given (use --dork or --dorks-file)")
             sys.exit(1)
+
+        if args.dorks_max:
+            # ONE FRESH ACCOUNT PER DORK, each draining its full free credit (~2900+ hosts)
+            res = run_dorks_max_per_account(dorks, password=args.password, out_dir=args.dork_out,
+                                            parallel=args.parallel)
+            out_json = os.path.join(args.dork_out or os.path.expanduser("~/.fofa-accounts/dorks"),
+                                    "_dorks_max_summary.json")
+            try:
+                os.makedirs(os.path.dirname(out_json), exist_ok=True)
+                with open(out_json, "w") as f:
+                    json.dump(res, f, indent=2)
+                print("[+] summary -> %s" % out_json)
+            except Exception as e:
+                print("[!] summary save failed: %s" % str(e)[:60])
+            sys.exit(0 if any(r.get("hosts") for r in res) else 1)
 
         port = args.dork_port
         if port is None:
