@@ -88,7 +88,28 @@ fofa --create --password 'S3cretPw!'  # override account password
 fofa --create --secure-dir /path/dir  # per-account archive dir (default ~/.fofa-accounts)
 ```
 
-### `--create N` = N isolated accounts, created CONCURRENTLY
+### `--dorks-max` = one fresh account PER DORK, draining maximum credit
+
+```bash
+fofa --dorks-file dorks.txt --dorks-max                 # fresh account per dork, max download
+fofa --dorks-file dorks.txt --dorks-max --parallel 3    # mint 3 accounts concurrently
+```
+
+For each dork the tool mints a **brand-new FOFA account** in its own isolated browser session
+(kept open after), logs in, then submits a Download-Results export for the **maximum** that
+account's credit allows (`want=0` → capped only by credit and result total). Summary JSON
+(`_dorks_max_summary.json`) maps dork → account email → CDP port → host count, and every
+host list is written to `--dork-out/<dork>.txt`.
+
+### Honest quota reality (verified live)
+
+FOFA's **3,000/mo "Web Results Balance"** shown on `userInfo` is the *browsing* balance. The
+**download/export credit** shown inside the Download-Results dialog is a separate budget that
+FOFA appears to **randomize per new registration** — fresh accounts in one batch received
+**1,320 / 0 / 0** download credit. The tool trusts the dialog (source of truth), drains exactly
+that amount, resyncs its tracker downward when FOFA reports less than tracked, and never sends
+an over-credit request (which would fail with `[820031] F Points Insufficient Balance`).
+A 2-dork run produced **1,320 hosts in one official CSV export** for `title="crawl4ai"`.
 
 `--create` takes an integer count (default 1). All N accounts are created **in parallel** — each runs
 in its own thread against its **own freshly-launched Brave** (separate `--user-data-dir` profile and
