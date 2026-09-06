@@ -15,7 +15,7 @@ Requires:
 Output: prints the FOFA credentials (email/password/username) to stdout and appends
 them to the out file as JSON. Exit 0 on success (account confirmed + logged in).
 """
-import sys, os, json, time, random, string, argparse, subprocess, urllib.request, urllib.parse, threading
+import sys, os, json, time, re, base64, random, string, argparse, subprocess, urllib.request, urllib.parse, threading
 
 # Guards concurrent registry / archive writes when --create N runs in parallel.
 _REGISTRY_LOCK = threading.Lock()
@@ -100,6 +100,283 @@ def poll_tempinbox_browser(page, email, timeout_s=120):
 
 
 EASY_PASSWORD = "SecPass123!x"
+
+# ============================ DORK HARVESTER ============================
+# FOFA free tier: 300 web queries/mo, 3,000 web result-points/mo.
+# The results UI shows 10 hosts per page; every page consumed costs 10 points
+# => 3,000 points / 10 per page = 300 pages/month max across ALL dorks.
+# (The REST API /api/v1/search/all requires a paid plan for free accounts:
+#  free accounts get "[-700] Account Invalid", so harvesting runs through the
+#  logged-in web session's result pages instead.)
+
+FOFA_POINTS_FREE = 3000       # free monthly web result points
+FOFA_POINTS_PER_PAGE = 10     # each results page (10 hosts) costs 10 points
+QUOTA_FILE = os.path.expanduser("~/.fofa-accounts/fofa_quota.json")
+
+
+def load_quota():
+    try:
+        with open(QUOTA_FILE) as f:
+            d = json.load(f)
+    except Exception:
+        d = {}
+    d.setdefault("period", time.strftime("%Y-%m"))
+    d.setdefault("used_points", 0)
+    if d.get("period") != time.strftime("%Y-%m"):
+        d["period"] = time.strftime("%Y-%m")
+        d["used_points"] = 0
+    return d
+
+
+def save_quota(d):
+    os.makedirs(os.path.dirname(QUOTA_FILE), exist_ok=True)
+    with open(QUOTA_FILE, "w") as f:
+        json.dump(d, f, indent=2)
+
+
+def quota_remaining():
+    d = load_quota()
+    return max(0, FOFA_POINTS_FREE - d["used_points"])
+
+
+def _parse_count(s, default=0):
+    try:
+        return int(str(s).replace(",", ""))
+    except Exception:
+        return default
+
+
+def _page_loaded(page):
+    """A results page is loaded when result rows OR the 'N results' total text is present.
+    (Service-style dorks like protocol=rdp render ip:port rows without <a> links; empty
+    results render only the total.)"""
+    try:
+        if page.evaluate("""() => {
+            for (const a of document.querySelectorAll('a[href]')) {
+                const h = a.href;
+                if (/^https?:\\/\\//.test(h) && !/fofa\\.info|x\\.com|twitter|t\\.me|github\\.com/i.test(h)) return true;
+            }
+            return false;
+        }"""):
+            return True
+        body = page.inner_text("body")
+        return bool(re.search(r'([\d,]+)\s+results', body))
+    except Exception:
+        return False
+
+
+def _page_total(page):
+    try:
+        body = page.inner_text("body")
+        m = re.search(r'([\d,]+)\s+results', body)
+        if m:
+            return int(m.group(1).replace(",", ""))
+    except Exception:
+        pass
+    return None
+
+
+def harvest_dork_download(page, dork, want=100, out_dir=None, dl_dir=None):
+    """Harvest hosts for one dork using FOFA's official Download Results function.
+
+    Free tier: 3,000 result-points/month. The download dialog consumes
+    '1 result = 1 F point' from the FREE CREDIT; a download only succeeds when
+    requested count <= remaining free credit (else '[820031] F Points Insufficient').
+
+    Flow: open results page -> open Download dialog -> read live free credit ->
+    set count -> submit -> poll /userInfo/downloadRecords until the new export is
+    'Available' -> download its CSV -> parse hosts.
+
+    want: how many results to request for this dork (capped by free credit).
+    Returns (hosts_list, downloaded_count, total_reported)."""
+    qb = base64.b64encode(dork.encode()).decode()
+    out_dir = out_dir or os.path.expanduser("~/.fofa-accounts/dorks")
+    os.makedirs(out_dir, exist_ok=True)
+
+    # ---- open the results page for the dork ----
+    url = f"https://en.fofa.info/result?qbase64={qb}"
+    last_err = None
+    loaded = False
+    for attempt in range(3):
+        try:
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(3)
+            for _ in range(15):
+                if _page_loaded(page):
+                    loaded = True
+                    break
+                time.sleep(1)
+            if loaded:
+                break
+        except Exception as e:
+            last_err = e
+            time.sleep(3)
+    if not loaded:
+        raise RuntimeError("results page failed to load: %s" % last_err)
+
+    total = _page_total(page)
+    if total == 0:
+        print("    [i] 0 results for this dork — nothing to download")
+        with open(os.path.join(out_dir, re.sub(r'[^A-Za-z0-9._-]+', '_', dork)[:80] + ".txt"), "w") as f:
+            pass
+        return [], 0, 0
+
+    # ---- snapshot existing download records so we can identify the NEW one ----
+    def list_records():
+        page.goto("https://en.fofa.info/userInfo/downloadRecords",
+                  wait_until="domcontentloaded", timeout=45000)
+        time.sleep(4)
+        return page.evaluate("""() => {
+            const rows = [...document.querySelectorAll('a')].filter(a => /Click to Download/.test(a.innerText||''));
+            return rows.map(a => ({href: a.href}));
+        }""")
+
+    before = {r["href"] for r in list_records()}
+
+    # ---- open the results page again + the Download dialog ----
+    page.goto(url, wait_until="domcontentloaded", timeout=60000)
+    time.sleep(4)
+    page.keyboard.press("End")
+    time.sleep(2)
+    page.evaluate("() => document.querySelector('.icon-down-011')?.closest('button')?.click()")
+    time.sleep(3)
+    dlg = page.evaluate("""() => {
+        const d = [...document.querySelectorAll('[aria-label="Download Results"], .el-dialog, .el-overlay-dialog')]
+            .find(x => x.offsetWidth || x.offsetHeight);
+        if (!d) return null;
+        const m = (d.innerText || '').match(/Free Credit:\\s*([\\d,]+)/);
+        return {free_credit: m ? m[1].replace(/,/g, '') : null};
+    }""")
+    if not dlg:
+        raise RuntimeError("Download Results dialog did not open")
+    free_credit = _parse_count(dlg.get("free_credit"), 0)
+
+    remaining = quota_remaining()
+    # The dialog credit is the source of truth. If the local tracker drifted (manual downloads
+    # elsewhere, earlier debug runs), resync it DOWN to FOFA's number.
+    if free_credit < remaining:
+        drift = remaining - free_credit
+        quota = load_quota()
+        quota["used_points"] = min(FOFA_POINTS_FREE, quota["used_points"] + drift)
+        save_quota(quota)
+        print("    [i] resynced quota tracker to FOFA's free credit (%d left; drift %d)"
+              % (free_credit, drift))
+        remaining = free_credit
+    n = min(want if want > 0 else 10**9, free_credit, remaining if remaining > 0 else 0,
+            total if total else want)
+    if n <= 0:
+        print("    [!] no credit left: dialog free-credit=%s tracked-remaining=%d" % (free_credit, remaining))
+        return [], 0, total
+    if n < want:
+        print("    [i] capping request to %d (want %d; credit %d, tracked %d, total %s)"
+              % (n, want, free_credit, remaining, total))
+
+    # ---- set the count and submit ----
+    page.evaluate("""(n) => {
+        const d = [...document.querySelectorAll('[aria-label="Download Results"], .el-dialog, .el-overlay-dialog')]
+            .find(x => x.offsetWidth || x.offsetHeight);
+        const inp = d.querySelector('input[type=number]');
+        const setter = Object.getOwnPropertyDescriptor(window.HTMLInputElement.prototype, 'value').set;
+        setter.call(inp, String(n));
+        inp.dispatchEvent(new Event('input', {bubbles: true}));
+        inp.dispatchEvent(new Event('change', {bubbles: true}));
+    }""", n)
+    time.sleep(1)
+    page.evaluate("""() => {
+        const d = [...document.querySelectorAll('[aria-label="Download Results"], .el-dialog, .el-overlay-dialog')]
+            .find(x => x.offsetWidth || x.offsetHeight);
+        const b = [...d.querySelectorAll('button')].find(b => (b.innerText || '').trim() === 'Download');
+        b.click();
+    }""")
+    time.sleep(4)
+
+    # ---- poll the records page until a NEW record appears (export is async) ----
+    new_rec = None
+    for _ in range(20):  # up to ~2.5 min
+        recs = list_records()
+        fresh = [r for r in recs if r["href"] not in before]
+        if fresh:
+            new_rec = fresh[0]
+            break
+        time.sleep(7)
+    if not new_rec:
+        raise RuntimeError("download request did not produce a record (check Download History)")
+
+    # ---- fetch the CSV via the session ----
+    fname = new_rec["href"].rstrip("/").split("/")[-1] or ("fofa_%s.csv" % re.sub(r'[^A-Za-z0-9._-]+', '_', dork)[:40])
+    dl_dir = dl_dir or out_dir
+    os.makedirs(dl_dir, exist_ok=True)
+    raw_path = os.path.join(dl_dir, fname)
+    with page.expect_download(timeout=120000) as dl_info:
+        page.evaluate("(href) => { const a=[...document.querySelectorAll('a')].find(a => a.href === href); a.click(); }",
+                      new_rec["href"])
+    dl_info.value.save_as(raw_path)
+
+    # ---- parse: first column is host ----
+    hosts = []
+    with open(raw_path, encoding="utf-8-sig", errors="replace") as f:
+        lines = [l for l in f.read().splitlines() if l.strip()]
+    for line in (lines[1:] if len(lines) > 1 else lines):
+        parts = line.split(",")
+        if parts:
+            hosts.append(parts[0].strip().strip('"'))
+    hosts = [h for h in hosts if h]
+
+    # ---- account the quota (1 result = 1 point) ----
+    quota = load_quota()
+    quota["used_points"] += len(hosts) if hosts else n
+    save_quota(quota)
+
+    # ---- save per-dork output (plain host list) ----
+    safe = re.sub(r'[^A-Za-z0-9._-]+', '_', dork)[:80]
+    out_file = os.path.join(out_dir, safe + ".txt")
+    with open(out_file, "w") as f:
+        f.write("\n".join(hosts) + ("\n" if hosts else ""))
+    print("    [+] %d hosts downloaded -> %s (total reported: %s; csv: %s)"
+          % (len(hosts), out_file, total, fname))
+    return hosts, len(hosts), total
+
+
+def dorks_from_session(session_json=None):
+    """Return (email, key, session) for the most recent account with session info."""
+    recs = []
+    session_json = session_json or os.path.expanduser("~/fofa-accounts.json")
+    if os.path.exists(session_json):
+        try:
+            recs = json.load(open(session_json))
+        except Exception:
+            recs = []
+    recs = [r for r in recs if r.get("session") and r["session"].get("brave_port")]
+    if not recs:
+        return None, None, None
+    return recs[-1].get("email"), recs[-1].get("password"), recs[-1]["session"]
+
+
+def run_dorks(dorks, brave_port, want=100, out_dir=None, quota_cap_points=None):
+    """Run a list of dorks through one logged-in session using the Download function.
+    want = results to download per dork. Returns dict dork->hosts."""
+    from playwright.sync_api import sync_playwright
+    results = {}
+    with sync_playwright() as pw:
+        browser = pw.chromium.connect_over_cdp("http://127.0.0.1:%d" % brave_port)
+        ctx = browser.contexts[0]
+        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+        for i, dork in enumerate(dorks, 1):
+            print("[*] dork %d/%d: %s (want %s)" % (i, len(dorks), dork, want if want else "max"))
+            if quota_cap_points is not None and quota_remaining() <= quota_cap_points:
+                print("[!] stopping: quota cap reached")
+                break
+            try:
+                hosts, got, total = harvest_dork_download(page, dork, want=want, out_dir=out_dir)
+                results[dork] = hosts
+            except Exception as e:
+                print("    [!] dork failed: %s" % str(e)[:80])
+                results[dork] = []
+        browser.close()
+    return results
+
+
+# ========================== /DORK HARVESTER ===========================
 
 
 def run_create(brave_port, out_file, password=EASY_PASSWORD, venv_python=None):
@@ -404,10 +681,57 @@ def main():
     ap.add_argument("--secure-dir", default=None, help="dir to save each account's creds+email (default ~/.fofa-accounts, env FOFA_SECURE_DIR)")
     ap.add_argument("--keep-sessions", action="store_true", help="leave each account's Brave OPEN after creation and record its CDP port+profile dir in the archive")
     ap.add_argument("--keep-brave", action="store_true", help="alias for --keep-sessions (keeps the auto-launched Braven running)")
+    # dork harvester
+    ap.add_argument("--dork", default=None, metavar='"QUERY"', help='search FOFA for a dork (e.g. --dork \'title="crawl4ai"\') and download the hosts')
+    ap.add_argument("--dorks-file", default=None, metavar="FILE", help="file with one dork per line (combined with/instead of --dork)")
+    ap.add_argument("--dork-port", type=int, default=None, help="CDP port of the logged-in Brave to harvest with (default: newest kept session)")
+    ap.add_argument("--dork-count", type=int, default=100, help="results to download per dork via the Download function (default 100; capped by free credit)")
+    ap.add_argument("--dork-pages", type=int, default=None, help="(legacy) pages per dork; converted to --dork-count = pages*10")
+    ap.add_argument("--dork-out", default=None, metavar="DIR", help="dir for per-dork host files (default ~/.fofa-accounts/dorks)")
+    ap.add_argument("--dork-cap", type=int, default=None, metavar="POINTS", help="stop when remaining quota points reach this floor")
+    ap.add_argument("--quota", action="store_true", help="print the tracked monthly quota and exit")
     args = ap.parse_args()
 
     if args.secure_dir:
         os.environ["FOFA_SECURE_DIR"] = args.secure_dir
+
+    # ---- dork-harvester mode ----
+    if args.dork or args.dorks_file or args.quota:
+        if args.quota:
+            d = load_quota()
+            print("quota period:      %s" % d["period"])
+            print("points used:       %d / %d" % (d["used_points"], FOFA_POINTS_FREE))
+            print("points remaining:  %d  (= %d pages of 10 hosts)" % (quota_remaining(), quota_remaining() // FOFA_POINTS_PER_PAGE))
+            sys.exit(0)
+
+        dorks = []
+        if args.dork:
+            dorks.append(args.dork)
+        if args.dorks_file:
+            with open(args.dorks_file) as f:
+                dorks += [l.strip() for l in f if l.strip() and not l.strip().startswith("#")]
+        if not dorks:
+            print("[!] no dorks given (use --dork or --dorks-file)")
+            sys.exit(1)
+
+        port = args.dork_port
+        if port is None:
+            _, _, sess = dorks_from_session()
+            if not sess:
+                print("[!] no kept session found. Run: fofa --create 1 --keep-sessions  (then retry the dork)")
+                sys.exit(1)
+            port = sess["brave_port"]
+            print("[*] using kept session on CDP port %d (profile %s)" % (port, sess.get("profile_dir")))
+        print("[*] quota: %d points remaining (%d pages)" % (quota_remaining(), quota_remaining() // FOFA_POINTS_PER_PAGE))
+        want = args.dork_count
+        if args.dork_pages is not None:
+            want = args.dork_pages * FOFA_POINTS_PER_PAGE  # legacy: pages -> results
+        results = run_dorks(dorks, port, want=want, out_dir=args.dork_out,
+                            quota_cap_points=(args.dork_cap if args.dork_cap is not None else 0))
+        total_hosts = sum(len(v) for v in results.values())
+        print("\n[OK] %d dork(s), %d hosts total. Files in %s" % (
+            len(results), total_hosts, args.dork_out or os.path.expanduser("~/.fofa-accounts/dorks")))
+        sys.exit(0)
 
     # parse the count: --create 5   (also accept --create 5 or bare --create -> 1)
     try:

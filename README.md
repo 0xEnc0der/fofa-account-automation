@@ -125,6 +125,41 @@ Each account's archive file (`~/.fofa-accounts/<email>.json`) includes a `sessio
 | `--password` | `SecPass123!x` | the FOFA account password (the tool's shared "easy" default) |
 | `--secure-dir` | `~/.fofa-accounts` | per-account file archive (creds + captured email + session info) |
 | `--python` | *(auto-detect)* | Python interpreter that has Playwright |
+| `--dork '"Q"'` | — | search FOFA for a dork and download the hosts (see below) |
+| `--dorks-file F` | — | file with one dork per line (`#` comments allowed) |
+| `--dork-count N` | `100` | results to download per dork (capped by remaining free credit) |
+| `--dork-port P` | *(newest session)* | CDP port of the logged-in Brave to harvest with |
+| `--dork-out DIR` | `~/.fofa-accounts/dorks` | per-dork host-list output dir |
+| `--dork-cap PTS` | `0` | stop the run when remaining points hit this floor |
+| `--quota` | — | print the tracked monthly download-quota and exit |
+
+---
+
+## Dork mode — official Download-Function harvesting
+
+```bash
+fofa --dork 'title="crawl4ai"'                       # single dork, 100 results
+fofa --dorks-file dorks.txt --dork-count 50          # batch, 50 results each
+fofa --dork 'protocol="rdp" && country="US"' --dork-count 200
+fofa --quota                                         # check remaining points
+```
+
+**How it works (no fragile page-scraping):** for each dork the tool opens the results page, opens
+FOFA's **Download Results** dialog, reads the live **Free Credit** (source of truth), caps the
+request (`want` vs credit vs result total), submits the export, then polls the
+**Download Records** page (`/userInfo/downloadRecords`) until the new export is `Available` and
+downloads its CSV. Hosts are parsed from the CSV (host, ip, port, protocol, title, domain,
+country, city, link, org) and written as a plain list to `<dork-out>/<sanitized-dork>.txt`.
+
+**Quota math (free tier):** 3,000 result-points/month; the dialog consumes **1 result = 1 point**
+from the free credit (NOT the paid F-point balance). A request larger than the credit fails with
+`[820031] F Points Insufficient Balance` — the tool pre-caps every request and never overdraws.
+The tracked balance in `~/.fofa-accounts/fofa_quota.json` auto-resyncs downward whenever FOFA's
+dialog shows less credit than the local counter (e.g. after manual downloads elsewhere).
+
+Verified against 10 dorks of mixed shape: huge result sets (Grafana 749k, Open-WebUI 147k,
+kubernetes 19k), tiny sets (spark-api, 29 results), service-style results with no web links
+(`protocol="rdp"`), and zero-result dorks (skipped cleanly).
 
 ### Output
 
