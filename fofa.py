@@ -23,8 +23,10 @@ _REGISTRY_LOCK = threading.Lock()
 CDP_BASE = "http://127.0.0.1:9222"
 REGISTER_URL = "https://i.nosec.org/register?locale=en&service=https://en.fofa.info/f_login?login_redirect_url=/"
 LOGIN_URL = "https://i.nosec.org/login?service=https://en.fofa.info/f_login?login_redirect_url=/"
-TEMPINBOX_API = "https://endpoint.tempinbox.xyz"
-TEMPINBOX_WEB = "https://www.tempinbox.xyz/"
+TEMPINBOX_API = "https://endpoint.tempinbox.xyz"   # BLACKLISTED by FOFA as of Sep 6 — unused
+TEMPINBOX_WEB = "https://www.tempinbox.xyz/"       # BLACKLISTED by FOFA as of Sep 6 — unused
+EMAILFAKE_WEB = "https://emailfake.com/"           # active provider (FOFA-accepted domain)
+EMAILFAKE_DOMAIN = "novacontigencia.xyz"
 
 
 def http_get(url):
@@ -56,46 +58,38 @@ def get_tempinbox_address():
     return addr
 
 
-def poll_tempinbox_browser(page, email, timeout_s=120):
-    """Poll the tempinbox /mailbox session view (via the browser) for the FOFA confirmation token.
-
-    IMPORTANT: tempinbox boxes created via the site (#create/#random) deliver via the /mailbox
-    session view (session cookie 'email'), NOT via the endpoint.tempinbox.xyz API — the API returns
-    [] for site-created boxes. So we read the DOM: open /mailbox, click the message, extract the
-    confirmation_token from the raw page content. Returns (confirm_url, message_dict)."""
+def poll_emailfake(page, email, timeout_s=150):
+    """Poll the emailfake.com inbox (same page renders the active box) for the FOFA
+    confirmation token. Returns (confirm_url, message_dict)."""
     import re as _re
-    url = "https://www.tempinbox.xyz/mailbox"
+    url = EMAILFAKE_WEB
     deadline = time.time() + timeout_s
     while time.time() < deadline:
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(4)
-            # click the confirmation message if present
-            try:
-                page.click("text=Confirmation instructions")
-            except Exception:
-                pass
-            time.sleep(3)
+            time.sleep(6)
+            body = page.inner_text("body")
+            if "Confirmation instructions" not in body and "no-reply@baimaohui.net" not in body:
+                time.sleep(6)
+                continue
             html = page.content()
             tok_m = _re.search(r'confirmation_token=([A-Za-z0-9_\-]+)', html)
             if tok_m:
                 confirm_url = "https://i.nosec.org/confirmation?confirmation_token=" + tok_m.group(1)
-                # capture the full visible message (body + sender + date) for secure archival
-                msg = {}
+                msg = {"sender": "no-reply@baimaohui.net", "subject": "Confirmation instructions"}
                 try:
+                    page.click("text=Confirmation instructions")
+                    time.sleep(3)
                     mbody = page.inner_text("body")
-                    msg["sender"] = "no-reply@baimaohui.net"
-                    msg["subject"] = "Confirmation instructions"
-                    # grab date near the message
-                    mdate = _re.search(r'\d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2} [AP]M', mbody)
-                    msg["date"] = mdate.group(0) if mdate else ""
+                    md = _re.search(r'\d{2} [A-Za-z]{3} \d{4} \d{2}:\d{2} [AP]M', mbody)
+                    msg["date"] = md.group(0) if md else ""
                     msg["message"] = mbody[:2000]
                 except Exception:
                     pass
                 return confirm_url, msg
         except Exception as e:
-            print("[!] mailbox poll retry:", str(e)[:50])
-        time.sleep(6)
+            print("[!] emailfake poll retry:", str(e)[:50])
+        time.sleep(8)
     return None, None
 
 
@@ -506,45 +500,34 @@ def run_create(brave_port, out_file, password=EASY_PASSWORD, venv_python=None):
         ctx = browser.contexts[0]
         page = ctx.pages[0] if ctx.pages else ctx.new_page()
 
-        # Generate a real tempinbox address on the FOFA-accepted tempinbox.xyz domain.
-        # The site only delivers mail to addresses it generated (via #create/#random with #domain).
-        # Kept #domain = tempinbox.xyz explicitly and use #create so the result is @tempinbox.xyz
-        # (Random rotates to other tempinbox domains that FOFA rejects).
+        # Generate a disposable address on emailfake.com using the FOFA-ACCEPTED
+        # domain novacontigencia.xyz (tempinbox.xyz was blacklisted by FOFA on Sep 6).
+        # emailfake lets us set BOTH the local part (#userName) and the domain
+        # (#domainName2); the inbox for that exact address renders on the same page,
+        # and it also serves many other domains if this one ever gets blocked.
         import re as _re
-        page.goto(TEMPINBOX_WEB, wait_until="domcontentloaded", timeout=60000)
+        page.goto(EMAILFAKE_WEB, wait_until="domcontentloaded", timeout=60000)
         time.sleep(6)
         user = "fofagen" + "".join(random.choices(string.ascii_lowercase, k=6))
-        # Set user + domain, then click Create. Do NOT let a prefill timeout abort the create.
         try:
-            page.fill("#user", user)
+            page.fill("#userName", user)
+            page.fill("#domainName2", EMAILFAKE_DOMAIN)
+            page.press("#domainName2", "Enter")
         except Exception as e:
-            print("[!] tempinbox user fill:", str(e)[:50])
+            print("[!] emailfake prefill:", str(e)[:50])
+        time.sleep(5)
+        email = user + "@" + EMAILFAKE_DOMAIN
+        # verify the inbox actually switched to our address
         try:
-            d = page.query_selector("#domain")
-            if d:
-                d.evaluate("el => { el.value = 'tempinbox.xyz'; el.dispatchEvent(new Event('input',{bubbles:true})); el.dispatchEvent(new Event('change',{bubbles:true})); }")
-        except Exception as e:
-            print("[!] tempinbox domain set:", str(e)[:50])
-        time.sleep(1)
-        try:
-            page.click("#create")
-        except Exception as e:
-            print("[!] tempinbox create:", str(e)[:50])
-        time.sleep(7)
-        # The create used our user + forced domain tempinbox.xyz, so the address is predictable:
-        email = user + "@tempinbox.xyz"
-        # Confirm it's actually registered by checking the /mailbox view lists it as active.
-        try:
-            page.goto("https://www.tempinbox.xyz/mailbox", wait_until="domcontentloaded", timeout=60000)
-            time.sleep(4)
             mbody = page.inner_text("body")
             if email not in mbody:
-                # fall back to whichever @tempinbox.xyz the mailbox shows (active box)
-                m = _re.findall(r'[\w.+-]+@tempinbox\.xyz', mbody)
-                if m:
-                    email = m[0]
+                # fall back to whatever address emailfake generated
+                m = _re.findall(r'[\w.+-]+@[\w.-]+\.\w{2,}', mbody)
+                pub = [x for x in m if "gmail.com" not in x and "example" not in x]
+                if pub:
+                    email = pub[0]
         except Exception as e:
-            print("[!] tempinbox mailbox verify:", str(e)[:50])
+            print("[!] emailfake verify:", str(e)[:50])
         print("[*] email:", email)
         print("[*] username:", username)
 
@@ -601,9 +584,9 @@ def run_create(brave_port, out_file, password=EASY_PASSWORD, venv_python=None):
         else:
             print("[?] register response:", body[:120].replace("\n", " / ")[:120])
 
-        # --- POLL TEMPINBOX (via browser /mailbox DOM) ---
-        print("[*] polling tempinbox /mailbox for activation email...")
-        confirm_url, activation_msg = poll_tempinbox_browser(page, email)
+        # --- POLL EMAILFAKE (inbox renders on the provider page) ---
+        print("[*] polling emailfake inbox for activation email...")
+        confirm_url, activation_msg = poll_emailfake(page, email)
         if not confirm_url:
             print("[!] activation email not found in tempinbox within 120s")
             browser.close()
