@@ -314,15 +314,31 @@ def harvest_dork_download(page, dork, want=100, out_dir=None, dl_dir=None, email
     if not new_rec:
         raise RuntimeError("download request did not produce a record (check Download History)")
 
-    # ---- fetch the CSV via the session ----
+    # ---- fetch the CSV via page-context fetch (session cookies apply).
+    # Playwright's download manager is fragile under memory pressure
+    # ('Download.save_as: canceled'), so we pull the CSV text directly. ----
     fname = new_rec["href"].rstrip("/").split("/")[-1] or ("fofa_%s.csv" % re.sub(r'[^A-Za-z0-9._-]+', '_', dork)[:40])
     dl_dir = dl_dir or out_dir
     os.makedirs(dl_dir, exist_ok=True)
     raw_path = os.path.join(dl_dir, fname)
-    with page.expect_download(timeout=120000) as dl_info:
-        page.evaluate("(href) => { const a=[...document.querySelectorAll('a')].find(a => a.href === href); a.click(); }",
-                      new_rec["href"])
-    dl_info.value.save_as(raw_path)
+    csv_text = None
+    for attempt in range(3):
+        try:
+            csv_text = page.evaluate(
+                """async (href) => {
+                    const r = await fetch(href, {credentials: 'include'});
+                    if (!r.ok) throw new Error('HTTP ' + r.status);
+                    return await r.text();
+                }""", new_rec["href"])
+            if csv_text and len(csv_text) > 10:
+                break
+        except Exception as e:
+            print("    [!] csv fetch attempt %d failed: %s" % (attempt + 1, str(e)[:60]))
+            time.sleep(5)
+    if not csv_text:
+        raise RuntimeError("could not fetch export CSV from %s" % new_rec["href"])
+    with open(raw_path, "w", encoding="utf-8") as f:
+        f.write(csv_text)
 
     # ---- parse: first column is host ----
     hosts = []
@@ -389,7 +405,7 @@ def run_dorks(dorks, brave_port, want=100, out_dir=None, quota_cap_points=None):
 
 
 def run_dorks_max_per_account(dorks, password=EASY_PASSWORD, out_dir=None, parallel=2,
-                              registry=None, keep_braves=True):
+                              registry=None, keep_braves=False):
     """One FRESH account per dork; each account downloads as many hosts as its free
     credit allows (want=0 -> capped only by credit/result-total). Accounts are minted
     `parallel` at a time, each in its own isolated Brave on its own CDP port.
@@ -418,14 +434,27 @@ def run_dorks_max_per_account(dorks, password=EASY_PASSWORD, out_dir=None, paral
                 raise RuntimeError("account creation failed")
             email = creds["email"]
 
-            # ---- max download for this dork on this account ----
-            with sync_playwright() as pw:
-                browser = pw.chromium.connect_over_cdp("http://127.0.0.1:%d" % port)
-                ctx = browser.contexts[0]
-                page = ctx.pages[0] if ctx.pages else ctx.new_page()
-                hosts, got, total = harvest_dork_download(page, dork, want=0, out_dir=out_dir,
-                                                          email=email)
-                browser.close()
+            # ---- max download for this dork on this account (with retries for
+            # transient infra failures: canceled downloads, CDP timeouts) ----
+            last_err = None
+            for attempt in range(3):
+                try:
+                    with sync_playwright() as pw:
+                        browser = pw.chromium.connect_over_cdp("http://127.0.0.1:%d" % port,
+                                                               timeout=60000)
+                        ctx = browser.contexts[0]
+                        page = ctx.pages[0] if ctx.pages else ctx.new_page()
+                        hosts, got, total = harvest_dork_download(page, dork, want=0,
+                                                                  out_dir=out_dir, email=email)
+                        browser.close()
+                    break
+                except Exception as e:
+                    last_err = e
+                    print("[%s] attempt %d failed: %s — retrying in 10s" % (tag, attempt + 1, str(e)[:60]))
+                    time.sleep(10)
+                    hosts, total = [], None
+            else:
+                raise RuntimeError("download failed after 3 attempts: %s" % last_err)
             print("[%s] DONE: %d hosts (total on FOFA: %s)" % (tag, len(hosts), total))
             return {"dork": dork, "email": email, "brave_port": port,
                     "profile_dir": profile_dir, "hosts": hosts, "total": total}
@@ -435,9 +464,17 @@ def run_dorks_max_per_account(dorks, password=EASY_PASSWORD, out_dir=None, paral
                     "profile_dir": profile_dir, "hosts": [], "total": total,
                     "error": str(e)[:120]}
         finally:
+            # Always close the session after harvest to avoid eating RAM —
+            # unless the caller explicitly asked to keep the browsers open.
             if not keep_braves and proc:
                 try:
                     proc.terminate()
+                    proc.wait(timeout=10)
+                except Exception:
+                    pass
+                import shutil
+                try:
+                    shutil.rmtree(profile_dir, ignore_errors=True)
                 except Exception:
                     pass
 
@@ -590,6 +627,14 @@ def run_create(brave_port, out_file, password=EASY_PASSWORD, venv_python=None):
                  "confirm_url": confirm_url, "final_url": final_url,
                  "logged_in": logged_in, "created": time.strftime("%Y-%m-%d %H:%M:%S"),
                  "activation_email": activation_msg}
+
+        # the caller may inject "session" info (brave_port/profile) into creds BEFORE
+        # this function returns so the registry always carries it; do that via a hook:
+        sess_hook = os.environ.get("FOFA_SESSION_HOOK")
+        if sess_hook and brave_port:
+            creds["session"] = {"brave_port": brave_port,
+                                "profile_dir": os.environ.get("FOFA_SESSION_PROFILE", ""),
+                                "keep_open": True}
         browser.close()
 
         # append to out file (registry) — thread-safe for concurrent --create N
@@ -709,10 +754,10 @@ def do_login(page, email, password, login_url, max_attempts=4):
     return logged_in, final_url, title
 
 
-_PORT_COUNTER = [9499]  # monotonic allocator; each call hands out the NEXT-lower port (unique)
+_PORT_COUNTER = [9899]  # monotonic allocator; each call hands out the NEXT-lower port (unique)
 
 
-def find_free_port(start=9400, end=9499):
+def find_free_port(start=9800, end=9899):
     """Return a free TCP port in [start,end]. UNIQUE per call (monotonic counter), so concurrent
     threads can never select the same port even if Brave hasn't finished binding yet. The counter
     walks DOWNWARD from a high base; if a port is already taken (leftover Brave), the caller's own
@@ -797,8 +842,10 @@ def main():
 
         if args.dorks_max:
             # ONE FRESH ACCOUNT PER DORK, each draining its full free credit (~2900+ hosts)
+            # Sessions are closed after each harvest (RAM-friendly); --keep-sessions holds them.
             res = run_dorks_max_per_account(dorks, password=args.password, out_dir=args.dork_out,
-                                            parallel=args.parallel)
+                                            parallel=args.parallel,
+                                            keep_braves=bool(args.keep_sessions or args.keep_brave))
             out_json = os.path.join(args.dork_out or os.path.expanduser("~/.fofa-accounts/dorks"),
                                     "_dorks_max_summary.json")
             try:
