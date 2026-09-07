@@ -205,15 +205,30 @@ def harvest_dork_download(page, dork, want=100, out_dir=None, dl_dir=None, email
     loaded = False
     for attempt in range(3):
         try:
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(3)
-            for _ in range(15):
+            # 'load' (not just domcontentloaded) + generous render wait: the SPA
+            # needs a moment to hydrate before results/total appear.
+            page.goto(url, wait_until="load", timeout=60000)
+            time.sleep(4)
+            for _ in range(25):
                 if _page_loaded(page):
                     loaded = True
                     break
                 time.sleep(1)
             if loaded:
                 break
+            # blank render -> hard reload once before the next attempt
+            try:
+                page.reload(wait_until="load", timeout=60000)
+                time.sleep(4)
+                for _ in range(20):
+                    if _page_loaded(page):
+                        loaded = True
+                        break
+                    time.sleep(1)
+                if loaded:
+                    break
+            except Exception:
+                pass
         except Exception as e:
             last_err = e
             time.sleep(3)
@@ -841,19 +856,73 @@ def main():
             sys.exit(0 if any(r.get("hosts") for r in res) else 1)
 
         port = args.dork_port
+        fresh_session = False
         if port is None:
+            # Try a kept session from the registry — but only if it's actually ALIVE.
             _, _, sess = dorks_from_session()
-            if not sess:
-                print("[!] no kept session found. Run: fofa --create 1 --keep-sessions  (then retry the dork)")
-                sys.exit(1)
-            port = sess["brave_port"]
-            print("[*] using kept session on CDP port %d (profile %s)" % (port, sess.get("profile_dir")))
+            if sess and sess.get("brave_port"):
+                cand = sess["brave_port"]
+                alive = False
+                try:
+                    import urllib.request as _ur
+                    with _ur.urlopen("http://127.0.0.1:%d/json/version" % cand, timeout=4) as r:
+                        alive = (r.status == 200)
+                except Exception:
+                    alive = False
+                if alive:
+                    port = cand
+                    print("[*] using kept session on CDP port %d (profile %s)" % (port, sess.get("profile_dir")))
+            if port is None:
+                # No kept session (or it's dead): mint a FRESH account on a new browser,
+                # then run the dork against it. This is now the default behavior.
+                py_ = args.python
+                if not py_:
+                    for cand_py in ["/home/kali/fofa-venv/bin/python3.14", "/home/kali/pb/bin/python3.13"]:
+                        if os.path.exists(cand_py):
+                            py_ = cand_py
+                            break
+                new_port = find_free_port()
+                if new_port is None:
+                    print("[!] no free port found")
+                    sys.exit(1)
+                print("[*] no live session found — minting a fresh account (new browser on port %d)" % new_port)
+                proc, profile_dir = launch_fresh_brave(new_port)
+                ok, creds = run_create(new_port, os.path.expanduser("~/fofa-accounts.json"),
+                                       args.password, py_)
+                if not ok or not creds:
+                    try:
+                        proc.terminate()
+                    except Exception:
+                        pass
+                    print("[!] fresh account creation failed")
+                    sys.exit(1)
+                port = new_port
+                fresh_session = True
+                # stamp session info like the other paths do
+                creds["session"] = {"brave_port": new_port, "profile_dir": profile_dir,
+                                    "keep_open": bool(args.keep_sessions or args.keep_brave)}
+                _save_secure(creds)
+                if not (args.keep_sessions or args.keep_brave):
+                    # hold the browser open for the dork run; close it at the end
+                    _dork_owned_proc = proc
+                else:
+                    _dork_owned_proc = None
+            else:
+                _dork_owned_proc = None
+        else:
+            _dork_owned_proc = None
         print("[*] quota: %d points remaining (%d pages)" % (quota_remaining(), quota_remaining() // FOFA_POINTS_PER_PAGE))
         want = args.dork_count
         if args.dork_pages is not None:
             want = args.dork_pages * FOFA_POINTS_PER_PAGE  # legacy: pages -> results
         results = run_dorks(dorks, port, want=want, out_dir=args.dork_out,
                             quota_cap_points=(args.dork_cap if args.dork_cap is not None else 0))
+        if _dork_owned_proc:
+            try:
+                _dork_owned_proc.terminate()
+                print("[+] closed the fresh session browser")
+            except Exception:
+                pass
         total_hosts = sum(len(v) for v in results.values())
         print("\n[OK] %d dork(s), %d hosts total. Files in %s" % (
             len(results), total_hosts, args.dork_out or os.path.expanduser("~/.fofa-accounts/dorks")))
